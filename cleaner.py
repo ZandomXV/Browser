@@ -5,6 +5,7 @@ Fetches a URL, cleans the HTML, writes result to a GitHub Gist.
 import os
 import json
 import requests
+import certifi
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
@@ -23,7 +24,7 @@ HEADERS = {
 def fetch(url):
     """Fetch the raw HTML from the target URL."""
     print(f"Fetching: {url}")
-    r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
+    r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True, verify=certifi.where())
     r.raise_for_status()
     print(f"Status: {r.status_code}, Length: {len(r.text)}")
     return r.text, r.url  # r.url = final URL after redirects
