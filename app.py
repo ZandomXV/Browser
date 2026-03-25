@@ -5,7 +5,8 @@ Async loading: returns spinner immediately, polls for result via JS.
 """
 import threading
 import webbrowser
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
+from urllib.parse import urlparse, urljoin
 from github_tunnel import dispatch_fetch, poll_result, cleanup_gist
 
 app = Flask(__name__)
@@ -14,6 +15,8 @@ app = Flask(__name__)
 PAGE_CACHE = {}
 # In-flight requests: request_id -> url
 IN_FLIGHT = {}
+# Track last browsed origin for resolving relative URLs
+LAST_ORIGIN = {"value": ""}
 
 HOME_PAGE = """<!DOCTYPE html>
 <html>
@@ -256,9 +259,13 @@ def browse():
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
+    # Track the origin for catch-all relative URL resolution
+    parsed = urlparse(url)
+    LAST_ORIGIN["value"] = f"{parsed.scheme}://{parsed.netloc}"
+
     # Check cache first
     if url in PAGE_CACHE:
-        html = rewrite_links(PAGE_CACHE[url])
+        html = rewrite_links(PAGE_CACHE[url], url)
         return html
 
     # Dispatch the workflow in a background thread
@@ -290,29 +297,44 @@ def poll_endpoint():
 
     # Check if the result has landed in cache
     if url and url in PAGE_CACHE:
-        html = rewrite_links(PAGE_CACHE[url])
+        html = rewrite_links(PAGE_CACHE[url], url)
         return jsonify({"ready": True, "html": html})
 
-    # Not ready yet — try a quick gist check
+    # Not ready yet
     return jsonify({"ready": False})
 
 
-def rewrite_links(html):
-    """Rewrite absolute links to route through /browse?url=..."""
+def rewrite_links(html, page_url=""):
+    """Rewrite all links to route through /browse?url=..."""
     import re
+
+    # Determine origin from the page URL for resolving relative paths
+    origin = ""
+    if page_url:
+        p = urlparse(page_url)
+        origin = f"{p.scheme}://{p.netloc}"
+
+    def proxy_url(url):
+        """Convert a URL to a proxied /browse?url=... URL."""
+        if not url or url.startswith(("/browse?", "#", "javascript:", "mailto:", "tel:", "NAVIGATE:", "data:")):
+            return None
+        if url.startswith("//"):
+            return f"/browse?url=https:{url}"
+        if url.startswith(("http://", "https://")):
+            return f"/browse?url={url}"
+        # Relative URL — resolve against the page's origin
+        if origin and url.startswith("/"):
+            return f"/browse?url={origin}{url}"
+        if origin and page_url:
+            return f"/browse?url={urljoin(page_url, url)}"
+        return None
 
     def replace_href(match):
         prefix = match.group(1)
         url = match.group(2)
-        # Skip already-proxied links, anchors, javascript, mailto, data
-        if url.startswith(("/browse?", "#", "javascript:", "mailto:", "tel:", "NAVIGATE:", "data:")):
-            return match.group(0)
-        # Protocol-relative URLs like //en.m.facebook.com/...
-        if url.startswith("//"):
-            return f'{prefix}/browse?url=https:{url}"'
-        # Absolute URLs
-        if url.startswith(("http://", "https://")):
-            return f'{prefix}/browse?url={url}"'
+        proxied = proxy_url(url)
+        if proxied:
+            return f'{prefix}{proxied}"'
         return match.group(0)
 
     # Rewrite href="..." links
@@ -322,12 +344,9 @@ def rewrite_links(html):
     def replace_action(match):
         prefix = match.group(1)
         url = match.group(2)
-        if url.startswith(("/browse?", "#", "javascript:", "data:")):
-            return match.group(0)
-        if url.startswith("//"):
-            return f'{prefix}/browse?url=https:{url}"'
-        if url.startswith(("http://", "https://")):
-            return f'{prefix}/browse?url={url}"'
+        proxied = proxy_url(url)
+        if proxied:
+            return f'{prefix}{proxied}"'
         return match.group(0)
 
     html = re.sub(r'(action=")([^"]*)"', replace_action, html)
@@ -339,6 +358,26 @@ def rewrite_links(html):
     )
 
     return html
+
+
+@app.route("/<path:path>")
+def catch_all(path):
+    """
+    Catch-all route: any relative URL that hits our server gets resolved
+    against the last browsed origin and proxied through /browse.
+    """
+    origin = LAST_ORIGIN.get("value", "")
+    if not origin:
+        return HOME_PAGE
+
+    # Reconstruct the full URL from the relative path + query string
+    full_path = f"/{path}"
+    qs = request.query_string.decode("utf-8")
+    if qs:
+        full_path += f"?{qs}"
+
+    target = f"{origin}{full_path}"
+    return redirect(f"/browse?url={target}")
 
 
 if __name__ == "__main__":
