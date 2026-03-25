@@ -182,20 +182,21 @@ LOADING_PAGE = """<!DOCTYPE html>
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     background: #0f0f23; color: #e0e0e0;
     min-height: 100vh;
-    display: flex; flex-direction: column;
   }}
   .top-bar {{
-    padding: 16px 24px;
+    padding: 12px 24px;
     background: #12122a;
     border-bottom: 1px solid #222;
     text-align: center;
+    position: sticky; top: 0; z-index: 100;
   }}
   .top-bar h2 {{ color: #bb86fc; font-size: 1.2rem; margin-bottom: 6px; }}
   .top-bar .url {{ color: #64b5f6; font-size: 13px; word-break: break-all; }}
   .progress-section {{
-    padding: 12px 24px;
+    padding: 10px 24px;
     background: #0d0d1f;
     border-bottom: 1px solid #1a1a33;
+    position: sticky; top: 58px; z-index: 99;
   }}
   .progress-wrap {{
     width: 100%; height: 24px;
@@ -224,7 +225,7 @@ LOADING_PAGE = """<!DOCTYPE html>
   .stage {{ color: #999; }}
   .timer {{ color: #666; }}
   .gallery-section {{
-    flex: 1; overflow-y: auto; padding: 16px;
+    padding: 16px;
   }}
   .gallery-header {{
     display: flex; justify-content: space-between; align-items: center;
