@@ -7,7 +7,7 @@ import threading
 import webbrowser
 from flask import Flask, request, jsonify, redirect
 from urllib.parse import urlparse, urljoin
-from github_tunnel import dispatch_fetch, poll_result, cleanup_gist
+from github_tunnel import dispatch_fetch, poll_result, cleanup_gist, poll_image_progress
 
 app = Flask(__name__)
 
@@ -204,6 +204,20 @@ LOADING_PAGE = """<!DOCTYPE html>
   .stage {{ color: #888; font-size: 14px; margin-bottom: 8px; }}
   .timer {{ color: #555; font-size: 13px; }}
   .tip {{ color: #444; font-size: 12px; margin-top: 20px; font-style: italic; }}
+  .gallery-label {{
+    color: #bb86fc; font-size: 13px; margin-top: 20px; margin-bottom: 8px;
+    display: none;
+  }}
+  .gallery {{
+    display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;
+    max-width: 500px; margin: 0 auto;
+  }}
+  .gallery img {{
+    width: 80px; height: 80px; object-fit: cover; border-radius: 6px;
+    border: 1px solid #333; opacity: 0; animation: fadeIn 0.4s forwards;
+  }}
+  @keyframes fadeIn {{ to {{ opacity: 1; }} }}
+  .img-count {{ color: #555; font-size: 12px; margin-top: 6px; }}
 </style>
 </head>
 <body>
@@ -216,6 +230,9 @@ LOADING_PAGE = """<!DOCTYPE html>
   </div>
   <div class="stage" id="stage">Starting...</div>
   <div class="timer" id="timer">0s elapsed</div>
+  <div class="gallery-label" id="glabel">Images downloaded so far:</div>
+  <div class="gallery" id="gallery"></div>
+  <div class="img-count" id="imgcount"></div>
   <div class="tip">Pages load in ~15-25 seconds via GitHub Actions</div>
 </div>
 <script>
@@ -225,11 +242,44 @@ var bar = document.getElementById("bar");
 var pctEl = document.getElementById("pct");
 var stageEl = document.getElementById("stage");
 var timerEl = document.getElementById("timer");
+var gallery = document.getElementById("gallery");
+var glabel = document.getElementById("glabel");
+var imgcount = document.getElementById("imgcount");
+var shownImages = 0;
+var pageReady = false;
 
 setInterval(function() {{
   var s = Math.floor((Date.now() - startTime) / 1000);
   timerEl.textContent = s + "s elapsed";
 }}, 1000);
+
+function checkImages() {{
+  if (pageReady) return;
+  fetch("/poll_images?request_id=" + rid)
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      var imgs = data.images || [];
+      if (imgs.length > shownImages) {{
+        glabel.style.display = "block";
+        for (var i = shownImages; i < imgs.length; i++) {{
+          var img = document.createElement("img");
+          img.src = imgs[i];
+          gallery.appendChild(img);
+        }}
+        shownImages = imgs.length;
+      }}
+      if (data.total > 0) {{
+        imgcount.textContent = data.downloaded + " / " + data.total + " images";
+      }}
+      if (!data.done && !pageReady) {{
+        setTimeout(checkImages, 4000);
+      }}
+    }})
+    .catch(function() {{
+      if (!pageReady) setTimeout(checkImages, 5000);
+    }});
+}}
+setTimeout(checkImages, 8000);
 
 function checkResult() {{
   fetch("/poll?request_id=" + rid)
@@ -240,6 +290,7 @@ function checkResult() {{
       pctEl.textContent = p + "%";
       stageEl.textContent = data.stage || "Working...";
       if (data.ready) {{
+        pageReady = true;
         stageEl.textContent = "Rendering page...";
         bar.style.width = "100%";
         pctEl.textContent = "100%";
@@ -249,6 +300,7 @@ function checkResult() {{
           document.close();
         }}, 300);
       }} else if (p === 0 && data.stage && data.stage.indexOf("Timed out") >= 0) {{
+        pageReady = true;
         stageEl.textContent = "Timed out. Reloading...";
         setTimeout(function() {{ location.reload(); }}, 2000);
       }} else {{
@@ -341,6 +393,16 @@ def browse():
 
     # Return loading page with request_id for JS polling
     return LOADING_PAGE.format(url=url, request_id=request_id)
+
+
+@app.route("/poll_images")
+def poll_images_endpoint():
+    """Return image previews downloaded so far by the Action."""
+    request_id = request.args.get("request_id", "")
+    if not request_id:
+        return jsonify({"images": [], "downloaded": 0, "total": 0})
+    data = poll_image_progress(request_id)
+    return jsonify(data)
 
 
 @app.route("/poll")

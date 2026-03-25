@@ -78,10 +78,42 @@ def download_image(url):
         return None
 
 
+def write_progress(request_id, images, total_expected, done=False):
+    """Write image preview progress to a separate gist file."""
+    try:
+        progress = {
+            "request_id": request_id,
+            "images": images,  # list of data URIs (small previews)
+            "downloaded": len(images),
+            "total": total_expected,
+            "done": done,
+        }
+        filename = f"{request_id}_progress.json"
+        payload = {
+            "files": {
+                filename: {
+                    "content": json.dumps(progress)
+                }
+            }
+        }
+        requests.patch(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers={
+                "Authorization": f"token {GH_TOKEN}",
+                "Accept": "application/vnd.github.v3+json",
+            },
+            json=payload,
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"Progress write error: {e}")
+
+
 def inline_images(soup, base_url):
     """
     Find all images in the soup, download them in parallel,
     and replace src with base64 data URIs.
+    Writes preview thumbnails to gist as they download.
     """
     # Collect image URLs to download
     img_tags = []
@@ -109,11 +141,14 @@ def inline_images(soup, base_url):
 
     # Limit number of images
     url_list = list(urls_to_fetch.keys())[:MAX_IMAGES]
-    print(f"Downloading {len(url_list)} images...")
+    total_expected = len(url_list)
+    print(f"Downloading {total_expected} images...")
 
-    # Download in parallel
+    # Download in parallel, stream previews to gist
     results = {}
+    preview_uris = []  # small data URIs for the loading page
     total_bytes = 0
+    batch_count = 0
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {pool.submit(download_image, u): u for u in url_list}
         for future in as_completed(futures):
@@ -121,9 +156,19 @@ def inline_images(soup, base_url):
             if result:
                 url, mime, b64, size = result
                 if total_bytes + size <= MAX_IMAGES_BYTES:
-                    results[url] = f"data:{mime};base64,{b64}"
+                    data_uri = f"data:{mime};base64,{b64}"
+                    results[url] = data_uri
                     total_bytes += size
+                    # Only send small images as previews (< 100KB encoded)
+                    if len(b64) < 130000:
+                        preview_uris.append(data_uri)
+                    batch_count += 1
+                    # Write progress every 3 images
+                    if batch_count % 3 == 0:
+                        write_progress(REQUEST_ID, preview_uris, total_expected)
 
+    # Final progress update
+    write_progress(REQUEST_ID, preview_uris, total_expected, done=True)
     print(f"Inlined {len(results)} images ({total_bytes // 1024}KB total)")
 
     # Replace src in img tags
