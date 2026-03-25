@@ -15,6 +15,8 @@ app = Flask(__name__)
 PAGE_CACHE = {}
 # In-flight requests: request_id -> url
 IN_FLIGHT = {}
+# Progress tracking: request_id -> {percent, stage}
+PROGRESS = {}
 # Track last browsed origin for resolving relative URLs
 LAST_ORIGIN = {"value": ""}
 
@@ -179,57 +181,76 @@ LOADING_PAGE = """<!DOCTYPE html>
     min-height: 100vh; margin: 0;
   }}
   .container {{ text-align: center; max-width: 500px; padding: 24px; }}
-  .spinner {{
-    width: 50px; height: 50px;
-    border: 5px solid #333; border-top-color: #bb86fc;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    margin: 0 auto 16px;
+  h2 {{ color: #bb86fc; margin-bottom: 16px; font-size: 1.4rem; }}
+  .url {{ color: #64b5f6; font-size: 14px; word-break: break-all; margin-bottom: 24px; }}
+  .progress-wrap {{
+    width: 100%; height: 28px;
+    background: #1a1a2e; border-radius: 14px;
+    overflow: hidden; border: 1px solid #333;
+    margin-bottom: 12px; position: relative;
   }}
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-  h2 {{ color: #bb86fc; margin-bottom: 8px; }}
-  p {{ color: #888; }}
-  .timer {{ font-size: 24px; color: #bb86fc; margin: 12px 0; }}
-  .dots::after {{ content: ''; animation: dots 1.5s steps(4,end) infinite; }}
-  @keyframes dots {{
-    0%, 20% {{ content: ''; }}
-    40% {{ content: '.'; }}
-    60% {{ content: '..'; }}
-    80%, 100% {{ content: '...'; }}
+  .progress-bar {{
+    height: 100%; border-radius: 14px;
+    background: linear-gradient(90deg, #6c63ff, #bb86fc);
+    transition: width 0.6s ease;
+    width: 0%;
   }}
+  .progress-text {{
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: bold; font-size: 13px; color: #fff;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+  }}
+  .stage {{ color: #888; font-size: 14px; margin-bottom: 8px; }}
+  .timer {{ color: #555; font-size: 13px; }}
+  .tip {{ color: #444; font-size: 12px; margin-top: 20px; font-style: italic; }}
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="spinner"></div>
-  <h2>Fetching page<span class="dots"></span></h2>
-  <p>{url}</p>
-  <div class="timer" id="timer">0s</div>
-  <p style="font-size:13px;">Routing through GitHub Actions tunnel</p>
-  <p id="status" style="font-size:12px;color:#555;margin-top:8px;">Waiting for GitHub Action to start...</p>
+  <h2>Loading page</h2>
+  <div class="url">{url}</div>
+  <div class="progress-wrap">
+    <div class="progress-bar" id="bar"></div>
+    <div class="progress-text" id="pct">0%</div>
+  </div>
+  <div class="stage" id="stage">Starting...</div>
+  <div class="timer" id="timer">0s elapsed</div>
+  <div class="tip">Pages load in ~15-25 seconds via GitHub Actions</div>
 </div>
 <script>
 var startTime = Date.now();
 var rid = "{request_id}";
-var timer = document.getElementById("timer");
-var status = document.getElementById("status");
+var bar = document.getElementById("bar");
+var pctEl = document.getElementById("pct");
+var stageEl = document.getElementById("stage");
+var timerEl = document.getElementById("timer");
 
 setInterval(function() {{
-  var elapsed = Math.floor((Date.now() - startTime) / 1000);
-  timer.textContent = elapsed + "s";
-  if (elapsed > 5) status.textContent = "Action running, fetching page...";
-  if (elapsed > 15) status.textContent = "Downloading images...";
-  if (elapsed > 30) status.textContent = "Almost there...";
+  var s = Math.floor((Date.now() - startTime) / 1000);
+  timerEl.textContent = s + "s elapsed";
 }}, 1000);
 
 function checkResult() {{
   fetch("/poll?request_id=" + rid)
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
+      var p = data.percent || 0;
+      bar.style.width = p + "%";
+      pctEl.textContent = p + "%";
+      stageEl.textContent = data.stage || "Working...";
       if (data.ready) {{
-        document.open();
-        document.write(data.html);
-        document.close();
+        stageEl.textContent = "Rendering page...";
+        bar.style.width = "100%";
+        pctEl.textContent = "100%";
+        setTimeout(function() {{
+          document.open();
+          document.write(data.html);
+          document.close();
+        }}, 300);
+      }} else if (p === 0 && data.stage && data.stage.indexOf("Timed out") >= 0) {{
+        stageEl.textContent = "Timed out. Reloading...";
+        setTimeout(function() {{ location.reload(); }}, 2000);
       }} else {{
         setTimeout(checkResult, 2000);
       }}
@@ -238,7 +259,7 @@ function checkResult() {{
       setTimeout(checkResult, 3000);
     }});
 }}
-setTimeout(checkResult, 3000);
+setTimeout(checkResult, 2000);
 </script>
 </body>
 </html>"""
@@ -272,11 +293,44 @@ def browse():
     request_id = dispatch_fetch(url)
     IN_FLIGHT[request_id] = url
 
-    # Start background polling thread
+    # Track progress
+    PROGRESS[request_id] = {"percent": 5, "stage": "Dispatching GitHub Action..."}
+
+    # Start background polling thread with progress updates
     def bg_poll():
-        result = poll_result(request_id, timeout=120, interval=2)
-        if result:
-            PAGE_CACHE[url] = result.get("html", "")
+        import time
+        PROGRESS[request_id] = {"percent": 10, "stage": "Waiting for GitHub Action to start..."}
+        deadline = time.time() + 120
+        filename = f"{request_id}.json"
+        poll_count = 0
+        while time.time() < deadline:
+            poll_count += 1
+            # Gradually increase progress while waiting
+            if poll_count <= 5:
+                pct = 10 + poll_count * 4  # 14, 18, 22, 26, 30
+                PROGRESS[request_id] = {"percent": pct, "stage": "Waiting for Action runner..."}
+            elif poll_count <= 10:
+                pct = 30 + (poll_count - 5) * 6  # 36, 42, 48, 54, 60
+                PROGRESS[request_id] = {"percent": pct, "stage": "Action running, fetching page..."}
+            elif poll_count <= 20:
+                pct = 60 + (poll_count - 10) * 3  # 63..90
+                PROGRESS[request_id] = {"percent": min(pct, 90), "stage": "Downloading & embedding images..."}
+            else:
+                PROGRESS[request_id] = {"percent": 92, "stage": "Almost done..."}
+
+            try:
+                result = poll_result(request_id, timeout=3, interval=2)
+                if result:
+                    PROGRESS[request_id] = {"percent": 100, "stage": "Done!"}
+                    PAGE_CACHE[url] = result.get("html", "")
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
+
+        if request_id in PROGRESS and PROGRESS[request_id]["percent"] < 100:
+            PROGRESS[request_id] = {"percent": 0, "stage": "Timed out. Try again."}
+
         # Cleanup old gist files
         try:
             cleanup_gist(keep_latest=3)
@@ -295,13 +349,15 @@ def poll_endpoint():
     request_id = request.args.get("request_id", "")
     url = IN_FLIGHT.get(request_id, "")
 
+    prog = PROGRESS.get(request_id, {"percent": 0, "stage": "Starting..."})
+
     # Check if the result has landed in cache
     if url and url in PAGE_CACHE:
         html = rewrite_links(PAGE_CACHE[url], url)
-        return jsonify({"ready": True, "html": html})
+        return jsonify({"ready": True, "html": html, "percent": 100, "stage": "Done!"})
 
-    # Not ready yet
-    return jsonify({"ready": False})
+    # Not ready yet — return progress
+    return jsonify({"ready": False, "percent": prog["percent"], "stage": prog["stage"]})
 
 
 def rewrite_links(html, page_url=""):
