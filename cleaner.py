@@ -45,24 +45,38 @@ def fetch(url):
     return r.text, r.url, r.status_code
 
 
-# Max total size for inlined images (8MB — gist limit is ~10MB)
-MAX_IMAGES_BYTES = 8 * 1024 * 1024
-# Max single image size (1MB)
-MAX_SINGLE_IMAGE = 1 * 1024 * 1024
-# Max number of images to inline (no practical limit)
+# Max total size for inlined images (3MB — gist API struggles with larger)
+MAX_IMAGES_BYTES = 3 * 1024 * 1024
+# Max single image size (200KB — keeps more images within budget)
+MAX_SINGLE_IMAGE = 200 * 1024
+# Max number of images to inline
 MAX_IMAGES = 200
+
+
+IMG_HEADERS = {
+    "User-Agent": HEADERS["User-Agent"],
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Referer": "",
+}
 
 
 def download_image(url):
     """Download a single image and return (url, mime_type, base64_data) or None."""
     try:
-        r = requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]},
-                         timeout=10, verify=certifi.where())
+        hdrs = dict(IMG_HEADERS)
+        # Set referer to the image's origin to avoid hotlink blocks
+        from urllib.parse import urlparse as _urlparse
+        p = _urlparse(url)
+        hdrs["Referer"] = f"{p.scheme}://{p.netloc}/"
+        # Try with SSL verification first, fall back without
+        try:
+            r = requests.get(url, headers=hdrs, timeout=15, verify=certifi.where())
+        except requests.exceptions.SSLError:
+            r = requests.get(url, headers=hdrs, timeout=15, verify=False)
         if r.status_code != 200:
             return None
         content_type = r.headers.get("Content-Type", "")
         if not content_type.startswith("image/"):
-            # Try to guess from URL
             guessed, _ = mimetypes.guess_type(url)
             if guessed and guessed.startswith("image/"):
                 content_type = guessed
@@ -71,6 +85,8 @@ def download_image(url):
         data = r.content
         if len(data) > MAX_SINGLE_IMAGE:
             return None
+        if len(data) < 100:
+            return None  # skip tiny/empty images
         b64 = base64.b64encode(data).decode("ascii")
         mime = content_type.split(";")[0].strip()
         return (url, mime, b64, len(data))

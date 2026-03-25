@@ -63,15 +63,32 @@ def poll_result(request_id, timeout=60, interval=2):
 
     while time.time() < deadline:
         try:
-            r = SESSION.get(endpoint, headers=_headers(), timeout=10)
+            r = SESSION.get(endpoint, headers=_headers(), timeout=30)
             if r.status_code == 200:
                 gist_data = r.json()
                 files = gist_data.get("files", {})
                 if filename in files:
-                    content = files[filename].get("content", "")
+                    file_info = files[filename]
+                    # If file is truncated (>1MB), fetch from raw_url
+                    if file_info.get("truncated"):
+                        raw_url = file_info.get("raw_url", "")
+                        if raw_url:
+                            print(f"[tunnel] File truncated, fetching raw URL...")
+                            raw_r = SESSION.get(raw_url, headers=_headers(), timeout=60)
+                            if raw_r.status_code == 200:
+                                content = raw_r.text
+                            else:
+                                print(f"[tunnel] Raw fetch failed: {raw_r.status_code}")
+                                time.sleep(interval)
+                                continue
+                        else:
+                            time.sleep(interval)
+                            continue
+                    else:
+                        content = file_info.get("content", "")
                     result = json.loads(content)
                     if result.get("request_id") == request_id:
-                        print(f"[tunnel] Got result for {request_id}")
+                        print(f"[tunnel] Got result for {request_id} ({len(content)} bytes)")
                         return result
         except Exception as e:
             print(f"[tunnel] Poll error: {e}")
