@@ -1,0 +1,34 @@
+name: Fetch Page
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL to fetch'
+        required: true
+      request_id:
+        description: 'Unique request ID'
+        required: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: Fetch and clean page
+        env:
+          TARGET_URL: ${{ github.event.inputs.url }}
+          REQUEST_ID: ${{ github.event.inputs.request_id }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python cleaner.py
