@@ -5,8 +5,10 @@ Async loading: returns spinner immediately, polls for result via JS.
 """
 import threading
 import webbrowser
+import time
+import re
 from flask import Flask, request, jsonify, redirect
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, quote
 from github_tunnel import dispatch_fetch, poll_result, cleanup_gist, poll_image_progress
 
 app = Flask(__name__)
@@ -348,48 +350,43 @@ def browse():
     # Track progress
     PROGRESS[request_id] = {"percent": 5, "stage": "Dispatching GitHub Action..."}
 
-    # Start background polling thread with progress updates
     def bg_poll():
-        import time
-        PROGRESS[request_id] = {"percent": 10, "stage": "Waiting for GitHub Action to start..."}
-        deadline = time.time() + 120
-        filename = f"{request_id}.json"
-        poll_count = 0
-        while time.time() < deadline:
-            poll_count += 1
-            # Gradually increase progress while waiting
-            if poll_count <= 5:
-                pct = 10 + poll_count * 4  # 14, 18, 22, 26, 30
-                PROGRESS[request_id] = {"percent": pct, "stage": "Waiting for Action runner..."}
-            elif poll_count <= 10:
-                pct = 30 + (poll_count - 5) * 6  # 36, 42, 48, 54, 60
-                PROGRESS[request_id] = {"percent": pct, "stage": "Action running, fetching page..."}
-            elif poll_count <= 20:
-                pct = 60 + (poll_count - 10) * 3  # 63..90
-                PROGRESS[request_id] = {"percent": min(pct, 90), "stage": "Downloading & embedding images..."}
-            else:
-                PROGRESS[request_id] = {"percent": 92, "stage": "Almost done..."}
-
-            try:
-                result = poll_result(request_id, timeout=3, interval=2)
-                if result:
-                    PROGRESS[request_id] = {"percent": 100, "stage": "Done!"}
-                    PAGE_CACHE[url] = result.get("html", "")
-                    break
-            except Exception:
-                pass
-            time.sleep(2)
-
-        if request_id in PROGRESS and PROGRESS[request_id]["percent"] < 100:
+        start = time.time()
+        PROGRESS[request_id] = {"percent": 10, "stage": "Waiting for runner..."}
+        # Single poll_result call — it handles the loop internally
+        result = poll_result(request_id, timeout=90, interval=3)
+        elapsed = int(time.time() - start)
+        if result:
+            PROGRESS[request_id] = {"percent": 100, "stage": "Done!"}
+            PAGE_CACHE[url] = result.get("html", "")
+            print(f"[app] Page ready in {elapsed}s")
+        else:
             PROGRESS[request_id] = {"percent": 0, "stage": "Timed out. Try again."}
-
-        # Cleanup old gist files
         try:
             cleanup_gist(keep_latest=3)
         except Exception:
             pass
 
     threading.Thread(target=bg_poll, daemon=True).start()
+
+    # Update progress in a separate lightweight thread
+    def progress_ticker():
+        for i in range(45):
+            time.sleep(2)
+            if PROGRESS.get(request_id, {}).get("percent", 0) >= 100:
+                return
+            pct = min(10 + i * 2, 95)
+            if i < 4:
+                stage = "Waiting for runner..."
+            elif i < 8:
+                stage = "Fetching page..."
+            elif i < 15:
+                stage = "Downloading images..."
+            else:
+                stage = "Almost done..."
+            PROGRESS[request_id] = {"percent": pct, "stage": stage}
+
+    threading.Thread(target=progress_ticker, daemon=True).start()
 
     # Return loading page with request_id for JS polling
     return LOADING_PAGE.format(url=url, request_id=request_id)
@@ -424,50 +421,46 @@ def poll_endpoint():
 
 def rewrite_links(html, page_url=""):
     """Rewrite all links to route through /browse?url=..."""
-    import re
-
     # Determine origin from the page URL for resolving relative paths
     origin = ""
     if page_url:
         p = urlparse(page_url)
         origin = f"{p.scheme}://{p.netloc}"
 
-    def proxy_url(url):
+    def make_proxy_url(url):
         """Convert a URL to a proxied /browse?url=... URL."""
-        if not url or url.startswith(("/browse?", "#", "javascript:", "mailto:", "tel:", "NAVIGATE:", "data:")):
+        if not url:
+            return None
+        url = url.strip()
+        if url.startswith(("/browse?", "#", "javascript:", "mailto:", "tel:", "NAVIGATE:", "data:")):
             return None
         if url.startswith("//"):
-            return f"/browse?url=https:{url}"
+            return "/browse?url=" + quote("https:" + url, safe=':/?&=#')
         if url.startswith(("http://", "https://")):
-            return f"/browse?url={url}"
-        # Relative URL — resolve against the page's origin
-        if origin and url.startswith("/"):
-            return f"/browse?url={origin}{url}"
-        if origin and page_url:
-            return f"/browse?url={urljoin(page_url, url)}"
+            return "/browse?url=" + quote(url, safe=':/?&=#')
+        # Relative URL
+        if origin:
+            if url.startswith("/"):
+                absolute = origin + url
+            elif page_url:
+                absolute = urljoin(page_url, url)
+            else:
+                return None
+            return "/browse?url=" + quote(absolute, safe=':/?&=#')
         return None
 
-    def replace_href(match):
-        prefix = match.group(1)
+    # Rewrite href=, action=, both double and single quoted
+    def replace_attr(match):
+        attr = match.group(1)   # e.g. href=" or action='
         url = match.group(2)
-        proxied = proxy_url(url)
+        q = match.group(3)      # closing quote
+        proxied = make_proxy_url(url)
         if proxied:
-            return f'{prefix}{proxied}"'
+            return f'{attr}{proxied}{q}'
         return match.group(0)
 
-    # Rewrite href="..." links
-    html = re.sub(r'(href=")([^"]*)"', replace_href, html)
-
-    # Rewrite form action="..." to go through proxy
-    def replace_action(match):
-        prefix = match.group(1)
-        url = match.group(2)
-        proxied = proxy_url(url)
-        if proxied:
-            return f'{prefix}{proxied}"'
-        return match.group(0)
-
-    html = re.sub(r'(action=")([^"]*)"', replace_action, html)
+    # Match href="..." href='...' action="..." action='...'
+    html = re.sub(r'''((?:href|action)=["'])([^"']*?)(["'])''', replace_attr, html)
 
     # Rewrite the Go button's NAVIGATE: handler
     html = html.replace(

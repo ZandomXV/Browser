@@ -45,12 +45,12 @@ def fetch(url):
     return r.text, r.url, r.status_code
 
 
-# Max total size for inlined images (2MB to keep gist manageable)
-MAX_IMAGES_BYTES = 2 * 1024 * 1024
-# Max single image size (500KB)
-MAX_SINGLE_IMAGE = 500 * 1024
-# Max number of images to inline
-MAX_IMAGES = 30
+# Max total size for inlined images (8MB — gist limit is ~10MB)
+MAX_IMAGES_BYTES = 8 * 1024 * 1024
+# Max single image size (1MB)
+MAX_SINGLE_IMAGE = 1 * 1024 * 1024
+# Max number of images to inline (no practical limit)
+MAX_IMAGES = 200
 
 
 def download_image(url):
@@ -78,14 +78,14 @@ def download_image(url):
         return None
 
 
-def write_progress(request_id, images, total_expected, done=False):
+def write_progress(request_id, images, downloaded, total, done=False):
     """Write image preview progress to a separate gist file."""
     try:
         progress = {
             "request_id": request_id,
-            "images": images,  # list of data URIs (small previews)
-            "downloaded": len(images),
-            "total": total_expected,
+            "images": images[-20:],  # last 20 thumbnails to keep size small
+            "downloaded": downloaded,
+            "total": total,
             "done": done,
         }
         filename = f"{request_id}_progress.json"
@@ -113,7 +113,6 @@ def inline_images(soup, base_url):
     """
     Find all images in the soup, download them in parallel,
     and replace src with base64 data URIs.
-    Writes preview thumbnails to gist as they download.
     """
     # Collect image URLs to download
     img_tags = []
@@ -144,12 +143,12 @@ def inline_images(soup, base_url):
     total_expected = len(url_list)
     print(f"Downloading {total_expected} images...")
 
-    # Download in parallel, stream previews to gist
+    # Download in parallel with progress streaming
     results = {}
-    preview_uris = []  # small data URIs for the loading page
+    preview_uris = []
     total_bytes = 0
-    batch_count = 0
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    count = 0
+    with ThreadPoolExecutor(max_workers=20) as pool:
         futures = {pool.submit(download_image, u): u for u in url_list}
         for future in as_completed(futures):
             result = future.result()
@@ -159,16 +158,16 @@ def inline_images(soup, base_url):
                     data_uri = f"data:{mime};base64,{b64}"
                     results[url] = data_uri
                     total_bytes += size
-                    # Only send small images as previews (< 100KB encoded)
-                    if len(b64) < 130000:
+                    count += 1
+                    # Keep small images as previews for loading screen
+                    if len(b64) < 50000:
                         preview_uris.append(data_uri)
-                    batch_count += 1
-                    # Write progress every 3 images
-                    if batch_count % 3 == 0:
-                        write_progress(REQUEST_ID, preview_uris, total_expected)
+                    # Stream progress every 5 images
+                    if count % 5 == 0:
+                        write_progress(REQUEST_ID, preview_uris, count, total_expected)
 
-    # Final progress update
-    write_progress(REQUEST_ID, preview_uris, total_expected, done=True)
+    # Final progress
+    write_progress(REQUEST_ID, preview_uris, count, total_expected, done=True)
     print(f"Inlined {len(results)} images ({total_bytes // 1024}KB total)")
 
     # Replace src in img tags
