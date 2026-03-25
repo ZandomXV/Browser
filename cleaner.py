@@ -5,8 +5,11 @@ Fetches a URL, cleans the HTML, writes result to a GitHub Gist.
 import os
 import re
 import json
+import base64
+import mimetypes
 import requests
 import certifi
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
@@ -42,42 +45,127 @@ def fetch(url):
     return r.text, r.url, r.status_code
 
 
+# Max total size for inlined images (2MB to keep gist manageable)
+MAX_IMAGES_BYTES = 2 * 1024 * 1024
+# Max single image size (500KB)
+MAX_SINGLE_IMAGE = 500 * 1024
+# Max number of images to inline
+MAX_IMAGES = 30
+
+
+def download_image(url):
+    """Download a single image and return (url, mime_type, base64_data) or None."""
+    try:
+        r = requests.get(url, headers={"User-Agent": HEADERS["User-Agent"]},
+                         timeout=10, verify=certifi.where())
+        if r.status_code != 200:
+            return None
+        content_type = r.headers.get("Content-Type", "")
+        if not content_type.startswith("image/"):
+            # Try to guess from URL
+            guessed, _ = mimetypes.guess_type(url)
+            if guessed and guessed.startswith("image/"):
+                content_type = guessed
+            else:
+                return None
+        data = r.content
+        if len(data) > MAX_SINGLE_IMAGE:
+            return None
+        b64 = base64.b64encode(data).decode("ascii")
+        mime = content_type.split(";")[0].strip()
+        return (url, mime, b64, len(data))
+    except Exception:
+        return None
+
+
+def inline_images(soup, base_url):
+    """
+    Find all images in the soup, download them in parallel,
+    and replace src with base64 data URIs.
+    """
+    # Collect image URLs to download
+    img_tags = []
+    urls_to_fetch = {}
+
+    for img in soup.find_all("img"):
+        src = None
+        # Try various source attributes
+        for attr in ["src", "data-src", "data-lazy-src", "data-lazy", "data-original"]:
+            val = img.get(attr)
+            if val and not val.startswith("data:"):
+                src = urljoin(base_url, val)
+                break
+        if src and src.startswith("http"):
+            img_tags.append((img, src))
+            urls_to_fetch[src] = None  # deduplicate
+
+    # Remove srcset — we can't inline those
+    for img in soup.find_all(["img", "source"]):
+        if img.get("srcset"):
+            del img["srcset"]
+
+    if not urls_to_fetch:
+        return
+
+    # Limit number of images
+    url_list = list(urls_to_fetch.keys())[:MAX_IMAGES]
+    print(f"Downloading {len(url_list)} images...")
+
+    # Download in parallel
+    results = {}
+    total_bytes = 0
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(download_image, u): u for u in url_list}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                url, mime, b64, size = result
+                if total_bytes + size <= MAX_IMAGES_BYTES:
+                    results[url] = f"data:{mime};base64,{b64}"
+                    total_bytes += size
+
+    print(f"Inlined {len(results)} images ({total_bytes // 1024}KB total)")
+
+    # Replace src in img tags
+    for img, src in img_tags:
+        if src in results:
+            img["src"] = results[src]
+            # Clean up lazy-load attrs since we have the real data now
+            for attr in ["data-src", "data-lazy-src", "data-lazy", "data-original",
+                         "loading"]:
+                if img.get(attr):
+                    del img[attr]
+
+
 def clean_html(html, base_url):
     """
     Strip JS, ads, heavy assets. Keep readable content + navigation links.
-    Rewrite all links to go through our proxy system.
-    Preserve images as much as possible.
+    Download and inline images as base64.
     """
     soup = BeautifulSoup(html, "lxml")
 
-    # Remove unwanted tags — but keep <style>, <svg>, <picture>, <source>
+    # Remove unwanted tags
     for tag_name in ["script", "noscript", "iframe", "object", "embed",
                      "applet", "canvas", "math", "template"]:
         for tag in soup.find_all(tag_name):
             tag.decompose()
 
-    # Remove <link> tags except stylesheets (they help with layout)
+    # Remove ALL <link> tags — external stylesheets won't load through firewall
     for tag in soup.find_all("link"):
-        if tag.get("rel") and "stylesheet" in tag.get("rel", []):
-            # Rewrite stylesheet href to absolute
-            if tag.get("href"):
-                tag["href"] = urljoin(base_url, tag["href"])
-        else:
-            tag.decompose()
+        tag.decompose()
 
-    # Remove event handler attributes but keep style attributes
+    # Remove event handler attributes
     for tag in soup.find_all(True):
         attrs_to_remove = [attr for attr in tag.attrs if attr.startswith("on")]
         for attr in attrs_to_remove:
             del tag[attr]
 
-    # Rewrite all links to absolute URLs (the local app will intercept them)
+    # Rewrite all links to absolute URLs
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.startswith(("javascript:", "#", "mailto:", "tel:")):
             continue
-        absolute = urljoin(base_url, href)
-        a["href"] = absolute
+        a["href"] = urljoin(base_url, href)
 
     # Rewrite form actions to absolute
     for form in soup.find_all("form", action=True):
@@ -85,36 +173,11 @@ def clean_html(html, base_url):
         if act and not act.startswith(("javascript:", "#")):
             form["action"] = urljoin(base_url, act)
 
-    # Rewrite ALL image-related attributes to absolute URLs
-    img_attrs = ["src", "data-src", "data-lazy", "data-lazy-src", "data-original",
-                 "data-image", "data-thumb", "data-thumb_url", "data-poster",
-                 "poster", "data-bg", "data-background"]
-    for img in soup.find_all(["img", "video", "source"]):
-        for attr in img_attrs:
-            val = img.get(attr)
-            if val and not val.startswith("data:"):
-                img[attr] = urljoin(base_url, val)
-        # Promote lazy-loaded src
-        if not img.get("src") or img["src"].startswith("data:"):
-            for fallback in ["data-src", "data-lazy-src", "data-lazy", "data-original"]:
-                val = img.get(fallback)
-                if val and not val.startswith("data:"):
-                    img["src"] = val
-                    break
-        # Rewrite srcset to absolute URLs
-        if img.get("srcset"):
-            parts = []
-            for entry in img["srcset"].split(","):
-                entry = entry.strip()
-                if not entry:
-                    continue
-                pieces = entry.split()
-                if pieces:
-                    pieces[0] = urljoin(base_url, pieces[0])
-                parts.append(" ".join(pieces))
-            img["srcset"] = ", ".join(parts)
+    # Download and inline images as base64
+    inline_images(soup, base_url)
 
-    # Rewrite background-image in inline styles to absolute URLs
+    # Inline background-image URLs as well (leave as-is, user's browser won't load them
+    # but at least keep the style structure)
     for tag in soup.find_all(style=True):
         style = tag["style"]
         def rewrite_bg_url(match):
@@ -124,9 +187,8 @@ def clean_html(html, base_url):
             return f"url('{urljoin(base_url, url)}')"
         tag["style"] = re.sub(r"url\(['\"]?([^)]+?)['\"]?\)", rewrite_bg_url, style)
 
-    # Add a minimal base style for readability
     title = soup.title.string if soup.title else urlparse(base_url).netloc
-    
+
     # Build clean HTML
     body = soup.find("body")
     body_content = str(body) if body else str(soup)

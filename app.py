@@ -1,13 +1,19 @@
 """
-app.py — Local browser shell using Flask + webview.
+app.py — Local browser shell using Flask.
 Intercepts navigation, routes through GitHub Actions tunnel.
+Async loading: returns spinner immediately, polls for result via JS.
 """
 import threading
 import webbrowser
-from flask import Flask, request, render_template_string, jsonify
-from github_tunnel import fetch_page, cleanup_gist
+from flask import Flask, request, jsonify
+from github_tunnel import dispatch_fetch, poll_result, cleanup_gist
 
 app = Flask(__name__)
+
+# In-memory cache: url -> {html, final_url, status}
+PAGE_CACHE = {}
+# In-flight requests: request_id -> url
+IN_FLIGHT = {}
 
 HOME_PAGE = """<!DOCTYPE html>
 <html>
@@ -161,7 +167,7 @@ LOADING_PAGE = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Loading...</title>
+<title>Loading - {url}</title>
 <style>
   body {{
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -169,7 +175,7 @@ LOADING_PAGE = """<!DOCTYPE html>
     display: flex; align-items: center; justify-content: center;
     min-height: 100vh; margin: 0;
   }}
-  .container {{ text-align: center; }}
+  .container {{ text-align: center; max-width: 500px; padding: 24px; }}
   .spinner {{
     width: 50px; height: 50px;
     border: 5px solid #333; border-top-color: #bb86fc;
@@ -180,16 +186,57 @@ LOADING_PAGE = """<!DOCTYPE html>
   @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
   h2 {{ color: #bb86fc; margin-bottom: 8px; }}
   p {{ color: #888; }}
+  .timer {{ font-size: 24px; color: #bb86fc; margin: 12px 0; }}
+  .dots::after {{ content: ''; animation: dots 1.5s steps(4,end) infinite; }}
+  @keyframes dots {{
+    0%, 20% {{ content: ''; }}
+    40% {{ content: '.'; }}
+    60% {{ content: '..'; }}
+    80%, 100% {{ content: '...'; }}
+  }}
 </style>
-<meta http-equiv="refresh" content="2;url=/poll?url={url}&request_id={request_id}">
 </head>
 <body>
 <div class="container">
   <div class="spinner"></div>
-  <h2>Fetching page...</h2>
+  <h2>Fetching page<span class="dots"></span></h2>
   <p>{url}</p>
-  <p style="font-size:13px;margin-top:12px;">Routing through GitHub Actions tunnel</p>
+  <div class="timer" id="timer">0s</div>
+  <p style="font-size:13px;">Routing through GitHub Actions tunnel</p>
+  <p id="status" style="font-size:12px;color:#555;margin-top:8px;">Waiting for GitHub Action to start...</p>
 </div>
+<script>
+var startTime = Date.now();
+var rid = "{request_id}";
+var timer = document.getElementById("timer");
+var status = document.getElementById("status");
+
+setInterval(function() {{
+  var elapsed = Math.floor((Date.now() - startTime) / 1000);
+  timer.textContent = elapsed + "s";
+  if (elapsed > 5) status.textContent = "Action running, fetching page...";
+  if (elapsed > 15) status.textContent = "Downloading images...";
+  if (elapsed > 30) status.textContent = "Almost there...";
+}}, 1000);
+
+function checkResult() {{
+  fetch("/poll?request_id=" + rid)
+    .then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      if (data.ready) {{
+        document.open();
+        document.write(data.html);
+        document.close();
+      }} else {{
+        setTimeout(checkResult, 2000);
+      }}
+    }})
+    .catch(function() {{
+      setTimeout(checkResult, 3000);
+    }});
+}}
+setTimeout(checkResult, 3000);
+</script>
 </body>
 </html>"""
 
@@ -201,6 +248,7 @@ def home():
 
 @app.route("/browse")
 def browse():
+    """Start a fetch and return a loading page immediately."""
     url = request.args.get("url", "").strip()
     if not url:
         return HOME_PAGE
@@ -208,19 +256,45 @@ def browse():
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    # Fetch the page through the tunnel (blocking — takes ~10-20s)
-    html, final_url, status = fetch_page(url, timeout=90)
+    # Check cache first
+    if url in PAGE_CACHE:
+        html = rewrite_links(PAGE_CACHE[url])
+        return html
 
-    # Rewrite links in the returned HTML to go through our proxy
-    html = rewrite_links(html)
+    # Dispatch the workflow in a background thread
+    request_id = dispatch_fetch(url)
+    IN_FLIGHT[request_id] = url
 
-    # Periodic cleanup
-    try:
-        cleanup_gist(keep_latest=3)
-    except Exception:
-        pass
+    # Start background polling thread
+    def bg_poll():
+        result = poll_result(request_id, timeout=120, interval=2)
+        if result:
+            PAGE_CACHE[url] = result.get("html", "")
+        # Cleanup old gist files
+        try:
+            cleanup_gist(keep_latest=3)
+        except Exception:
+            pass
 
-    return html
+    threading.Thread(target=bg_poll, daemon=True).start()
+
+    # Return loading page with request_id for JS polling
+    return LOADING_PAGE.format(url=url, request_id=request_id)
+
+
+@app.route("/poll")
+def poll_endpoint():
+    """JS polls this to check if a page is ready."""
+    request_id = request.args.get("request_id", "")
+    url = IN_FLIGHT.get(request_id, "")
+
+    # Check if the result has landed in cache
+    if url and url in PAGE_CACHE:
+        html = rewrite_links(PAGE_CACHE[url])
+        return jsonify({"ready": True, "html": html})
+
+    # Not ready yet — try a quick gist check
+    return jsonify({"ready": False})
 
 
 def rewrite_links(html):
