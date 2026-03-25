@@ -177,67 +177,163 @@ LOADING_PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <title>Loading - {url}</title>
 <style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     background: #0f0f23; color: #e0e0e0;
-    display: flex; align-items: center; justify-content: center;
-    min-height: 100vh; margin: 0;
+    min-height: 100vh;
+    display: flex; flex-direction: column;
   }}
-  .container {{ text-align: center; max-width: 500px; padding: 24px; }}
-  h2 {{ color: #bb86fc; margin-bottom: 16px; font-size: 1.4rem; }}
-  .url {{ color: #64b5f6; font-size: 14px; word-break: break-all; margin-bottom: 24px; }}
+  .top-bar {{
+    padding: 16px 24px;
+    background: #12122a;
+    border-bottom: 1px solid #222;
+    text-align: center;
+  }}
+  .top-bar h2 {{ color: #bb86fc; font-size: 1.2rem; margin-bottom: 6px; }}
+  .top-bar .url {{ color: #64b5f6; font-size: 13px; word-break: break-all; }}
+  .progress-section {{
+    padding: 12px 24px;
+    background: #0d0d1f;
+    border-bottom: 1px solid #1a1a33;
+  }}
   .progress-wrap {{
-    width: 100%; height: 28px;
-    background: #1a1a2e; border-radius: 14px;
+    width: 100%; height: 24px;
+    background: #1a1a2e; border-radius: 12px;
     overflow: hidden; border: 1px solid #333;
-    margin-bottom: 12px; position: relative;
+    position: relative; margin-bottom: 6px;
   }}
   .progress-bar {{
-    height: 100%; border-radius: 14px;
-    background: linear-gradient(90deg, #6c63ff, #bb86fc);
-    transition: width 0.6s ease;
-    width: 0%;
+    height: 100%; border-radius: 12px;
+    background: linear-gradient(90deg, #6c63ff, #bb86fc, #64b5f6);
+    background-size: 200% 100%;
+    animation: shimmer 2s ease infinite;
+    transition: width 0.5s ease; width: 0%;
   }}
+  @keyframes shimmer {{ 0%{{background-position:200% 0}} 100%{{background-position:-200% 0}} }}
   .progress-text {{
     position: absolute; top: 0; left: 0; right: 0; bottom: 0;
     display: flex; align-items: center; justify-content: center;
-    font-weight: bold; font-size: 13px; color: #fff;
-    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+    font-weight: bold; font-size: 12px; color: #fff;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.7);
   }}
-  .stage {{ color: #888; font-size: 14px; margin-bottom: 8px; }}
-  .timer {{ color: #555; font-size: 13px; }}
-  .tip {{ color: #444; font-size: 12px; margin-top: 20px; font-style: italic; }}
-  .gallery-label {{
-    color: #bb86fc; font-size: 13px; margin-top: 20px; margin-bottom: 8px;
-    display: none;
+  .info-row {{
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 13px;
+  }}
+  .stage {{ color: #999; }}
+  .timer {{ color: #666; }}
+  .gallery-section {{
+    flex: 1; overflow-y: auto; padding: 16px;
+  }}
+  .gallery-header {{
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px; display: none;
+  }}
+  .gallery-header h3 {{ color: #bb86fc; font-size: 14px; }}
+  .gallery-header .badge {{
+    background: #6c63ff; color: #fff; padding: 2px 10px;
+    border-radius: 10px; font-size: 12px; font-weight: bold;
   }}
   .gallery {{
-    display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;
-    max-width: 500px; margin: 0 auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 10px;
   }}
-  .gallery img {{
-    width: 80px; height: 80px; object-fit: cover; border-radius: 6px;
-    border: 1px solid #333; opacity: 0; animation: fadeIn 0.4s forwards;
+  .gallery .thumb {{
+    position: relative; aspect-ratio: 1;
+    border-radius: 8px; overflow: hidden;
+    border: 2px solid #222; cursor: pointer;
+    transition: border-color 0.2s, transform 0.2s;
+    background: #1a1a2e;
+  }}
+  .gallery .thumb:hover {{
+    border-color: #bb86fc; transform: scale(1.03);
+    z-index: 1;
+  }}
+  .gallery .thumb img {{
+    width: 100%; height: 100%; object-fit: cover;
+    opacity: 0; animation: fadeIn 0.5s ease forwards;
   }}
   @keyframes fadeIn {{ to {{ opacity: 1; }} }}
-  .img-count {{ color: #555; font-size: 12px; margin-top: 6px; }}
+  .gallery .thumb .new-badge {{
+    position: absolute; top: 4px; right: 4px;
+    background: #6c63ff; color: #fff; font-size: 9px;
+    padding: 1px 6px; border-radius: 6px; font-weight: bold;
+    animation: fadeIn 0.3s ease forwards;
+  }}
+  .empty-msg {{
+    text-align: center; color: #444; padding: 40px 20px;
+    font-size: 14px;
+  }}
+
+  /* Lightbox */
+  .lightbox {{
+    display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.92); z-index: 9999;
+    flex-direction: column; align-items: center; justify-content: center;
+  }}
+  .lightbox.open {{ display: flex; animation: fadeIn 0.2s ease; }}
+  .lightbox img {{
+    max-width: 90vw; max-height: 80vh; border-radius: 8px;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+  }}
+  .lightbox .close-btn {{
+    position: absolute; top: 16px; right: 20px;
+    background: none; border: none; color: #fff; font-size: 32px;
+    cursor: pointer; opacity: 0.7; transition: opacity 0.2s;
+  }}
+  .lightbox .close-btn:hover {{ opacity: 1; }}
+  .lightbox .nav-btn {{
+    position: absolute; top: 50%; transform: translateY(-50%);
+    background: rgba(255,255,255,0.1); border: none; color: #fff;
+    font-size: 28px; padding: 12px 16px; cursor: pointer;
+    border-radius: 8px; transition: background 0.2s;
+  }}
+  .lightbox .nav-btn:hover {{ background: rgba(255,255,255,0.2); }}
+  .lightbox .nav-prev {{ left: 16px; }}
+  .lightbox .nav-next {{ right: 16px; }}
+  .lightbox .img-counter {{
+    color: #888; font-size: 13px; margin-top: 12px;
+  }}
 </style>
 </head>
 <body>
-<div class="container">
-  <h2>Loading page</h2>
+
+<div class="top-bar">
+  <h2>Loading page...</h2>
   <div class="url">{url}</div>
+</div>
+
+<div class="progress-section">
   <div class="progress-wrap">
     <div class="progress-bar" id="bar"></div>
     <div class="progress-text" id="pct">0%</div>
   </div>
-  <div class="stage" id="stage">Starting...</div>
-  <div class="timer" id="timer">0s elapsed</div>
-  <div class="gallery-label" id="glabel">Images downloaded so far:</div>
-  <div class="gallery" id="gallery"></div>
-  <div class="img-count" id="imgcount"></div>
-  <div class="tip">Pages load in ~15-25 seconds via GitHub Actions</div>
+  <div class="info-row">
+    <span class="stage" id="stage">Starting...</span>
+    <span class="timer" id="timer">0s</span>
+  </div>
 </div>
+
+<div class="gallery-section">
+  <div class="gallery-header" id="gheader">
+    <h3>Images downloaded</h3>
+    <span class="badge" id="imgcount">0</span>
+  </div>
+  <div class="gallery" id="gallery"></div>
+  <div class="empty-msg" id="emptymsg">Waiting for images to download...</div>
+</div>
+
+<!-- Lightbox -->
+<div class="lightbox" id="lightbox">
+  <button class="close-btn" id="lb-close">&times;</button>
+  <button class="nav-btn nav-prev" id="lb-prev">&#8249;</button>
+  <button class="nav-btn nav-next" id="lb-next">&#8250;</button>
+  <img id="lb-img" src="" />
+  <div class="img-counter" id="lb-counter"></div>
+</div>
+
 <script>
 var startTime = Date.now();
 var rid = "{request_id}";
@@ -246,16 +342,55 @@ var pctEl = document.getElementById("pct");
 var stageEl = document.getElementById("stage");
 var timerEl = document.getElementById("timer");
 var gallery = document.getElementById("gallery");
-var glabel = document.getElementById("glabel");
+var gheader = document.getElementById("gheader");
 var imgcount = document.getElementById("imgcount");
+var emptymsg = document.getElementById("emptymsg");
 var shownImages = 0;
 var pageReady = false;
+var allImageSrcs = [];
 
+// Timer
 setInterval(function() {{
   var s = Math.floor((Date.now() - startTime) / 1000);
-  timerEl.textContent = s + "s elapsed";
+  var m = Math.floor(s / 60);
+  timerEl.textContent = m > 0 ? m + "m " + (s % 60) + "s" : s + "s";
 }}, 1000);
 
+// Lightbox
+var lbImg = document.getElementById("lb-img");
+var lbCounter = document.getElementById("lb-counter");
+var lightbox = document.getElementById("lightbox");
+var lbIndex = 0;
+
+function openLightbox(idx) {{
+  lbIndex = idx;
+  lbImg.src = allImageSrcs[idx];
+  lbCounter.textContent = (idx + 1) + " / " + allImageSrcs.length;
+  lightbox.classList.add("open");
+}}
+function closeLightbox() {{ lightbox.classList.remove("open"); }}
+function lbPrev() {{
+  lbIndex = (lbIndex - 1 + allImageSrcs.length) % allImageSrcs.length;
+  lbImg.src = allImageSrcs[lbIndex];
+  lbCounter.textContent = (lbIndex + 1) + " / " + allImageSrcs.length;
+}}
+function lbNext() {{
+  lbIndex = (lbIndex + 1) % allImageSrcs.length;
+  lbImg.src = allImageSrcs[lbIndex];
+  lbCounter.textContent = (lbIndex + 1) + " / " + allImageSrcs.length;
+}}
+document.getElementById("lb-close").onclick = closeLightbox;
+document.getElementById("lb-prev").onclick = lbPrev;
+document.getElementById("lb-next").onclick = lbNext;
+lightbox.onclick = function(e) {{ if (e.target === lightbox) closeLightbox(); }};
+document.addEventListener("keydown", function(e) {{
+  if (!lightbox.classList.contains("open")) return;
+  if (e.key === "Escape") closeLightbox();
+  if (e.key === "ArrowLeft") lbPrev();
+  if (e.key === "ArrowRight") lbNext();
+}});
+
+// Image polling
 function checkImages() {{
   if (pageReady) return;
   fetch("/poll_images?request_id=" + rid)
@@ -263,16 +398,29 @@ function checkImages() {{
     .then(function(data) {{
       var imgs = data.images || [];
       if (imgs.length > shownImages) {{
-        glabel.style.display = "block";
+        gheader.style.display = "flex";
+        emptymsg.style.display = "none";
         for (var i = shownImages; i < imgs.length; i++) {{
+          var idx = allImageSrcs.length;
+          allImageSrcs.push(imgs[i]);
+          var thumb = document.createElement("div");
+          thumb.className = "thumb";
+          thumb.setAttribute("data-idx", idx);
+          thumb.onclick = (function(j) {{ return function() {{ openLightbox(j); }}; }})(idx);
           var img = document.createElement("img");
           img.src = imgs[i];
-          gallery.appendChild(img);
+          var badge = document.createElement("span");
+          badge.className = "new-badge";
+          badge.textContent = "NEW";
+          setTimeout((function(b){{ return function(){{ b.remove(); }}; }})(badge), 3000);
+          thumb.appendChild(img);
+          thumb.appendChild(badge);
+          gallery.appendChild(thumb);
         }}
         shownImages = imgs.length;
       }}
       if (data.total > 0) {{
-        imgcount.textContent = data.downloaded + " / " + data.total + " images";
+        imgcount.textContent = data.downloaded + " / " + data.total;
       }}
       if (!data.done && !pageReady) {{
         setTimeout(checkImages, 4000);
@@ -284,6 +432,7 @@ function checkImages() {{
 }}
 setTimeout(checkImages, 8000);
 
+// Page result polling
 function checkResult() {{
   fetch("/poll?request_id=" + rid)
     .then(function(r) {{ return r.json(); }})
@@ -301,7 +450,7 @@ function checkResult() {{
           document.open();
           document.write(data.html);
           document.close();
-        }}, 300);
+        }}, 500);
       }} else if (p === 0 && data.stage && data.stage.indexOf("Timed out") >= 0) {{
         pageReady = true;
         stageEl.textContent = "Timed out. Reloading...";
