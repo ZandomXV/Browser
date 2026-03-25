@@ -34,11 +34,17 @@ HEADERS = {
 }
 
 
+# Shared session — carries cookies from page load to image downloads
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+SESSION.verify = certifi.where()
+
+
 def fetch(url):
-    """Fetch the raw HTML from the target URL."""
+    """Fetch the raw HTML from the target URL using shared session."""
     print(f"Fetching: {url}")
-    r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True, verify=certifi.where())
-    print(f"Status: {r.status_code}, Length: {len(r.text)}")
+    r = SESSION.get(url, timeout=30, allow_redirects=True)
+    print(f"Status: {r.status_code}, Length: {len(r.text)}, Cookies: {len(SESSION.cookies)}")
     # Don't raise on 4xx — many sites return usable HTML with 4xx codes
     if r.status_code >= 500:
         r.raise_for_status()
@@ -53,26 +59,23 @@ MAX_SINGLE_IMAGE = 200 * 1024
 MAX_IMAGES = 200
 
 
-IMG_HEADERS = {
-    "User-Agent": HEADERS["User-Agent"],
-    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-    "Referer": "",
-}
-
-
-def download_image(url):
-    """Download a single image and return (url, mime_type, base64_data) or None."""
+def download_image(url, session):
+    """Download a single image using the shared session (carries cookies)."""
     try:
-        hdrs = dict(IMG_HEADERS)
-        # Set referer to the image's origin to avoid hotlink blocks
         from urllib.parse import urlparse as _urlparse
         p = _urlparse(url)
-        hdrs["Referer"] = f"{p.scheme}://{p.netloc}/"
-        # Try with SSL verification first, fall back without
+        # Use session but override Accept and Referer for images
+        hdrs = {
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": f"{p.scheme}://{p.netloc}/",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
         try:
-            r = requests.get(url, headers=hdrs, timeout=15, verify=certifi.where())
+            r = session.get(url, headers=hdrs, timeout=15, allow_redirects=True)
         except requests.exceptions.SSLError:
-            r = requests.get(url, headers=hdrs, timeout=15, verify=False)
+            r = session.get(url, headers=hdrs, timeout=15, allow_redirects=True, verify=False)
         if r.status_code != 200:
             return None
         content_type = r.headers.get("Content-Type", "")
@@ -81,7 +84,15 @@ def download_image(url):
             if guessed and guessed.startswith("image/"):
                 content_type = guessed
             else:
-                return None
+                # Accept octet-stream as image if URL looks like an image
+                if content_type.startswith("application/octet-stream"):
+                    ext = p.path.rsplit(".", 1)[-1].lower() if "." in p.path else ""
+                    if ext in ("jpg", "jpeg", "png", "gif", "webp", "svg", "ico", "bmp"):
+                        content_type = f"image/{ext}"
+                    else:
+                        return None
+                else:
+                    return None
         data = r.content
         if len(data) > MAX_SINGLE_IMAGE:
             return None
@@ -125,11 +136,14 @@ def write_progress(request_id, images, downloaded, total, done=False):
         print(f"Progress write error: {e}")
 
 
-def inline_images(soup, base_url):
+def inline_images(soup, base_url, session=None):
     """
     Find all images in the soup, download them in parallel,
     and replace src with base64 data URIs.
+    Uses the shared session to carry cookies from the page load.
     """
+    if session is None:
+        session = SESSION
     # Collect image URLs to download
     img_tags = []
     urls_to_fetch = {}
@@ -165,7 +179,7 @@ def inline_images(soup, base_url):
     total_bytes = 0
     count = 0
     with ThreadPoolExecutor(max_workers=20) as pool:
-        futures = {pool.submit(download_image, u): u for u in url_list}
+        futures = {pool.submit(download_image, u, session): u for u in url_list}
         for future in as_completed(futures):
             result = future.result()
             if result:
