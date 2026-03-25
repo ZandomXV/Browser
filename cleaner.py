@@ -51,57 +51,91 @@ def fetch(url):
     return r.text, r.url, r.status_code
 
 
-# Max total size for inlined images (3MB — gist API struggles with larger)
-MAX_IMAGES_BYTES = 3 * 1024 * 1024
-# Max single image size (200KB — keeps more images within budget)
-MAX_SINGLE_IMAGE = 200 * 1024
+# Max total size for inlined images (5MB — gist raw_url handles this)
+MAX_IMAGES_BYTES = 5 * 1024 * 1024
+# Max single image size (500KB)
+MAX_SINGLE_IMAGE = 500 * 1024
 # Max number of images to inline
 MAX_IMAGES = 200
 
 
+def _make_img_session(page_url):
+    """Create a clean session for downloading images with proper browser headers."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": HEADERS["Sec-Ch-Ua"],
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+    })
+    # Copy cookies from the main session
+    s.cookies.update(SESSION.cookies)
+    s.verify = certifi.where()
+    return s
+
+
+# Stats for debugging
+_img_stats = {"ok": 0, "fail_status": 0, "fail_type": 0, "fail_size": 0, "fail_err": 0}
+
+
 def download_image(url, session):
-    """Download a single image using the shared session (carries cookies)."""
+    """Download a single image."""
+    global _img_stats
     try:
         from urllib.parse import urlparse as _urlparse
         p = _urlparse(url)
-        # Use session but override Accept and Referer for images
+        # Minimal headers — don't send Sec-Fetch which can trigger blocks
         hdrs = {
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             "Referer": f"{p.scheme}://{p.netloc}/",
-            "Sec-Fetch-Dest": "image",
-            "Sec-Fetch-Mode": "no-cors",
-            "Sec-Fetch-Site": "same-origin",
         }
         try:
             r = session.get(url, headers=hdrs, timeout=15, allow_redirects=True)
         except requests.exceptions.SSLError:
             r = session.get(url, headers=hdrs, timeout=15, allow_redirects=True, verify=False)
         if r.status_code != 200:
+            _img_stats["fail_status"] += 1
+            if _img_stats["fail_status"] <= 5:
+                print(f"  [img] FAIL {r.status_code} {url[:80]}")
             return None
-        content_type = r.headers.get("Content-Type", "")
-        if not content_type.startswith("image/"):
+        content_type = r.headers.get("Content-Type", "").lower()
+        # Accept any image type, octet-stream, or empty content type
+        is_image = (
+            content_type.startswith("image/") or
+            content_type.startswith("application/octet-stream") or
+            content_type == "" or
+            content_type.startswith("binary/")
+        )
+        if not is_image:
+            # Last resort: guess from URL
             guessed, _ = mimetypes.guess_type(url)
             if guessed and guessed.startswith("image/"):
                 content_type = guessed
-            else:
-                # Accept octet-stream as image if URL looks like an image
-                if content_type.startswith("application/octet-stream"):
-                    ext = p.path.rsplit(".", 1)[-1].lower() if "." in p.path else ""
-                    if ext in ("jpg", "jpeg", "png", "gif", "webp", "svg", "ico", "bmp"):
-                        content_type = f"image/{ext}"
-                    else:
-                        return None
-                else:
-                    return None
+                is_image = True
+        if not is_image:
+            _img_stats["fail_type"] += 1
+            if _img_stats["fail_type"] <= 3:
+                print(f"  [img] BAD TYPE '{content_type}' {url[:80]}")
+            return None
+        # If content_type isn't image/*, guess from URL
+        if not content_type.startswith("image/"):
+            guessed, _ = mimetypes.guess_type(url)
+            content_type = guessed if guessed else "image/jpeg"
         data = r.content
         if len(data) > MAX_SINGLE_IMAGE:
+            _img_stats["fail_size"] += 1
             return None
         if len(data) < 100:
-            return None  # skip tiny/empty images
+            return None
+        _img_stats["ok"] += 1
         b64 = base64.b64encode(data).decode("ascii")
         mime = content_type.split(";")[0].strip()
         return (url, mime, b64, len(data))
-    except Exception:
+    except Exception as e:
+        _img_stats["fail_err"] += 1
+        if _img_stats["fail_err"] <= 3:
+            print(f"  [img] ERROR {type(e).__name__}: {e} {url[:60]}")
         return None
 
 
@@ -140,10 +174,11 @@ def inline_images(soup, base_url, session=None):
     """
     Find all images in the soup, download them in parallel,
     and replace src with base64 data URIs.
-    Uses the shared session to carry cookies from the page load.
     """
-    if session is None:
-        session = SESSION
+    global _img_stats
+    _img_stats = {"ok": 0, "fail_status": 0, "fail_type": 0, "fail_size": 0, "fail_err": 0}
+    # Use a dedicated image session with cookies but clean headers
+    img_session = _make_img_session(base_url)
     # Collect image URLs to download
     img_tags = []
     urls_to_fetch = {}
@@ -179,7 +214,7 @@ def inline_images(soup, base_url, session=None):
     total_bytes = 0
     count = 0
     with ThreadPoolExecutor(max_workers=20) as pool:
-        futures = {pool.submit(download_image, u, session): u for u in url_list}
+        futures = {pool.submit(download_image, u, img_session): u for u in url_list}
         for future in as_completed(futures):
             result = future.result()
             if result:
@@ -199,6 +234,7 @@ def inline_images(soup, base_url, session=None):
     # Final progress
     write_progress(REQUEST_ID, preview_uris, count, total_expected, done=True)
     print(f"Inlined {len(results)} images ({total_bytes // 1024}KB total)")
+    print(f"  Stats: {_img_stats}")
 
     # Replace src in img tags, remove ones that failed to inline
     removed = 0
