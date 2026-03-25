@@ -110,7 +110,7 @@ def write_progress(request_id, images, downloaded, total, done=False):
     try:
         progress = {
             "request_id": request_id,
-            "images": images[-20:],  # last 20 thumbnails to keep size small
+            "images": images,  # send all previews
             "downloaded": downloaded,
             "total": total,
             "done": done,
@@ -189,8 +189,8 @@ def inline_images(soup, base_url, session=None):
                     results[url] = data_uri
                     total_bytes += size
                     count += 1
-                    # Keep small images as previews for loading screen
-                    if len(b64) < 50000:
+                    # Keep small images as previews for loading screen (< 15KB base64)
+                    if len(b64) < 20000:
                         preview_uris.append(data_uri)
                     # Stream progress every 5 images
                     if count % 5 == 0:
@@ -200,7 +200,8 @@ def inline_images(soup, base_url, session=None):
     write_progress(REQUEST_ID, preview_uris, count, total_expected, done=True)
     print(f"Inlined {len(results)} images ({total_bytes // 1024}KB total)")
 
-    # Replace src in img tags
+    # Replace src in img tags, remove ones that failed to inline
+    removed = 0
     for img, src in img_tags:
         if src in results:
             img["src"] = results[src]
@@ -209,6 +210,12 @@ def inline_images(soup, base_url, session=None):
                          "loading"]:
                 if img.get(attr):
                     del img[attr]
+        else:
+            # Remove images that weren't inlined — ISP will block external URLs
+            img.decompose()
+            removed += 1
+    if removed:
+        print(f"Removed {removed} images that couldn't be inlined")
 
 
 def clean_html(html, base_url):
