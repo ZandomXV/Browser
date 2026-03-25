@@ -23,7 +23,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 lxml
+        run: pip install requests beautifulsoup4 lxml certifi
 
       - name: Fetch and clean page
         env:
@@ -31,4 +31,7 @@ jobs:
           REQUEST_ID: ${{ github.event.inputs.request_id }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
           GIST_ID: ${{ secrets.GIST_ID }}
-        run: python cleaner.py
+          SSL_CERT_FILE: ${{ github.workspace }}/cacert.pem
+        run: |
+          python -c "import certifi; import shutil; shutil.copy(certifi.where(), 'cacert.pem')"
+          python cleaner.py
