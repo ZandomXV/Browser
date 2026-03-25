@@ -3,6 +3,7 @@ cleaner.py — Runs inside GitHub Actions.
 Fetches a URL, cleans the HTML, writes result to a GitHub Gist.
 """
 import os
+import re
 import json
 import requests
 import certifi
@@ -15,9 +16,19 @@ GH_TOKEN = os.environ["GH_TOKEN"]
 GIST_ID = os.environ["GIST_ID"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
 }
 
 
@@ -36,17 +47,26 @@ def clean_html(html, base_url):
     """
     Strip JS, ads, heavy assets. Keep readable content + navigation links.
     Rewrite all links to go through our proxy system.
+    Preserve images as much as possible.
     """
     soup = BeautifulSoup(html, "lxml")
 
-    # Remove unwanted tags entirely
-    for tag_name in ["script", "noscript", "style", "iframe", "object", "embed",
-                     "applet", "video", "audio", "canvas", "svg", "math",
-                     "template", "link", "meta"]:
+    # Remove unwanted tags — but keep <style>, <svg>, <picture>, <source>
+    for tag_name in ["script", "noscript", "iframe", "object", "embed",
+                     "applet", "canvas", "math", "template"]:
         for tag in soup.find_all(tag_name):
             tag.decompose()
 
-    # Remove event handler attributes
+    # Remove <link> tags except stylesheets (they help with layout)
+    for tag in soup.find_all("link"):
+        if tag.get("rel") and "stylesheet" in tag.get("rel", []):
+            # Rewrite stylesheet href to absolute
+            if tag.get("href"):
+                tag["href"] = urljoin(base_url, tag["href"])
+        else:
+            tag.decompose()
+
+    # Remove event handler attributes but keep style attributes
     for tag in soup.find_all(True):
         attrs_to_remove = [attr for attr in tag.attrs if attr.startswith("on")]
         for attr in attrs_to_remove:
@@ -60,15 +80,44 @@ def clean_html(html, base_url):
         absolute = urljoin(base_url, href)
         a["href"] = absolute
 
-    # Rewrite image sources to absolute
-    for img in soup.find_all("img"):
-        for attr in ["src", "data-src", "data-lazy"]:
+    # Rewrite ALL image-related attributes to absolute URLs
+    img_attrs = ["src", "data-src", "data-lazy", "data-lazy-src", "data-original",
+                 "data-image", "data-thumb", "data-thumb_url", "data-poster",
+                 "poster", "data-bg", "data-background"]
+    for img in soup.find_all(["img", "video", "source"]):
+        for attr in img_attrs:
             val = img.get(attr)
             if val and not val.startswith("data:"):
                 img[attr] = urljoin(base_url, val)
-        # Set src from data-src if src is missing
-        if not img.get("src") and img.get("data-src"):
-            img["src"] = img["data-src"]
+        # Promote lazy-loaded src
+        if not img.get("src") or img["src"].startswith("data:"):
+            for fallback in ["data-src", "data-lazy-src", "data-lazy", "data-original"]:
+                val = img.get(fallback)
+                if val and not val.startswith("data:"):
+                    img["src"] = val
+                    break
+        # Rewrite srcset to absolute URLs
+        if img.get("srcset"):
+            parts = []
+            for entry in img["srcset"].split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                pieces = entry.split()
+                if pieces:
+                    pieces[0] = urljoin(base_url, pieces[0])
+                parts.append(" ".join(pieces))
+            img["srcset"] = ", ".join(parts)
+
+    # Rewrite background-image in inline styles to absolute URLs
+    for tag in soup.find_all(style=True):
+        style = tag["style"]
+        def rewrite_bg_url(match):
+            url = match.group(1).strip("\"'")
+            if url.startswith("data:"):
+                return match.group(0)
+            return f"url('{urljoin(base_url, url)}')"
+        tag["style"] = re.sub(r"url\(['\"]?([^)]+?)['\"]?\)", rewrite_bg_url, style)
 
     # Add a minimal base style for readability
     title = soup.title.string if soup.title else urlparse(base_url).netloc
@@ -95,7 +144,8 @@ def clean_html(html, base_url):
   }}
   a {{ color: #64b5f6; text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
-  img {{ max-width: 100%; height: auto; border-radius: 4px; }}
+  img, picture, video {{ max-width: 100%; height: auto; border-radius: 4px; display: inline-block; }}
+  img[src] {{ min-width: 20px; min-height: 20px; }}
   h1, h2, h3 {{ color: #bb86fc; }}
   pre, code {{ background: #16213e; padding: 4px 8px; border-radius: 4px; overflow-x: auto; }}
   table {{ border-collapse: collapse; width: 100%; }}
