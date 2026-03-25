@@ -25,9 +25,11 @@ def fetch(url):
     """Fetch the raw HTML from the target URL."""
     print(f"Fetching: {url}")
     r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True, verify=certifi.where())
-    r.raise_for_status()
     print(f"Status: {r.status_code}, Length: {len(r.text)}")
-    return r.text, r.url  # r.url = final URL after redirects
+    # Don't raise on 4xx — many sites return usable HTML with 4xx codes
+    if r.status_code >= 500:
+        r.raise_for_status()
+    return r.text, r.url, r.status_code
 
 
 def clean_html(html, base_url):
@@ -159,9 +161,9 @@ def write_to_gist(request_id, html, status_code, final_url):
 
 def main():
     try:
-        html, final_url = fetch(TARGET_URL)
+        html, final_url, status_code = fetch(TARGET_URL)
         cleaned = clean_html(html, final_url)
-        write_to_gist(REQUEST_ID, cleaned, 200, final_url)
+        write_to_gist(REQUEST_ID, cleaned, status_code, final_url)
         print("Done! Result written to gist.")
     except Exception as e:
         error_html = f"<html><body><h1>Error</h1><p>{str(e)}</p><p>URL: {TARGET_URL}</p></body></html>"
