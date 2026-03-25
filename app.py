@@ -7,8 +7,9 @@ import threading
 import webbrowser
 import time
 import re
+import html as html_mod
 from flask import Flask, request, jsonify, redirect
-from urllib.parse import urlparse, urljoin, quote
+from urllib.parse import urlparse, urljoin
 from github_tunnel import dispatch_fetch, poll_result, cleanup_gist, poll_image_progress
 
 app = Flask(__name__)
@@ -431,13 +432,14 @@ def rewrite_links(html, page_url=""):
         """Convert a URL to a proxied /browse?url=... URL."""
         if not url:
             return None
-        url = url.strip()
+        # Decode HTML entities like &amp; -> & before processing
+        url = html_mod.unescape(url.strip())
         if url.startswith(("/browse?", "#", "javascript:", "mailto:", "tel:", "NAVIGATE:", "data:")):
             return None
         if url.startswith("//"):
-            return "/browse?url=" + quote("https:" + url, safe=':/?&=#')
+            return "/browse?url=https:" + url
         if url.startswith(("http://", "https://")):
-            return "/browse?url=" + quote(url, safe=':/?&=#')
+            return "/browse?url=" + url
         # Relative URL
         if origin:
             if url.startswith("/"):
@@ -446,7 +448,7 @@ def rewrite_links(html, page_url=""):
                 absolute = urljoin(page_url, url)
             else:
                 return None
-            return "/browse?url=" + quote(absolute, safe=':/?&=#')
+            return "/browse?url=" + absolute
         return None
 
     # Rewrite href=, action=, both double and single quoted
